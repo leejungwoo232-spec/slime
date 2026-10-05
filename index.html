@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<title>Slime</title>
+<style>
+  :root {
+    --paper: #ffffff;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    background: var(--paper);
+  }
+  *, *::before, *::after { box-sizing: inherit; }
+  html { height: 100%; scroll-padding-top: env(safe-area-inset-top, 0px); }
+  html, body { margin: 0; height: 100%; background: var(--paper); overflow: hidden; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+  canvas.grabbing { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="감정에 따라 색이 변하는 슬라임. 드래그해서 돌리고 꾹 눌러 쥘 수 있습니다."></canvas>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const canvas = document.getElementById('c');
+const IS_MOBILE = matchMedia('(pointer: coarse)').matches || /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent);
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: !IS_MOBILE, powerPreference: 'high-performance' });
+let pixelRatio = Math.min(window.devicePixelRatio, IS_MOBILE ? 1.5 : 2);
+renderer.setPixelRatio(pixelRatio);
+renderer.setClearColor(0xffffff, 1);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 100);
+camera.position.set(0, 0, 6);
+
+const noiseGLSL = `
+vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec4 mod289(vec4 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec4 permute(vec4 x){return mod289(((x*34.0)+1.0)*x);}
+vec4 taylorInvSqrt(vec4 r){return 1.79284291400159-0.85373472095314*r;}
+float snoise(vec3 v){
+  const vec2 C=vec2(1.0/6.0,1.0/3.0); const vec4 D=vec4(0.0,0.5,1.0,2.0);
+  vec3 i=floor(v+dot(v,C.yyy)); vec3 x0=v-i+dot(i,C.xxx);
+  vec3 g=step(x0.yzx,x0.xyz); vec3 l=1.0-g;
+  vec3 i1=min(g.xyz,l.zxy); vec3 i2=max(g.xyz,l.zxy);
+  vec3 x1=x0-i1+C.xxx; vec3 x2=x0-i2+C.yyy; vec3 x3=x0-D.yyy;
+  i=mod289(i);
+  vec4 p=permute(permute(permute(i.z+vec4(0.0,i1.z,i2.z,1.0))+i.y+vec4(0.0,i1.y,i2.y,1.0))+i.x+vec4(0.0,i1.x,i2.x,1.0));
+  float n_=0.142857142857; vec3 ns=n_*D.wyz-D.xzx;
+  vec4 j=p-49.0*floor(p*ns.z*ns.z);
+  vec4 x_=floor(j*ns.z); vec4 y_=floor(j-7.0*x_);
+  vec4 x=x_*ns.x+ns.yyyy; vec4 y=y_*ns.x+ns.yyyy; vec4 h=1.0-abs(x)-abs(y);
+  vec4 b0=vec4(x.xy,y.xy); vec4 b1=vec4(x.zw,y.zw);
+  vec4 s0=floor(b0)*2.0+1.0; vec4 s1=floor(b1)*2.0+1.0; vec4 sh=-step(h,vec4(0.0));
+  vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy; vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
+  vec3 p0=vec3(a0.xy,h.x); vec3 p1=vec3(a0.zw,h.y); vec3 p2=vec3(a1.xy,h.z); vec3 p3=vec3(a1.zw,h.w);
+  vec4 norm=taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+  p0*=norm.x;p1*=norm.y;p2*=norm.z;p3*=norm.w;
+  vec4 m=max(0.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.0); m=m*m;
+  return 42.0*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
+}`;
+
+const uniforms = {
+  uTime: { value: 0 }, uReal: { value: 0 },
+  uTwist: { value: new THREE.Vector3() }, uSpin: { value: new THREE.Vector3() },
+  uDir: { value: new THREE.Vector3(0,0,1) }, uAmp: { value: 0 },
+  uGrabDir: { value: new THREE.Vector3(0,0,1) }, uDent: { value: 0 },
+  uTremble: { value: 0 },
+  uPal: { value: Array.from({length: 6}, () => new THREE.Vector3()) },  // 감정 팔레트
+  uIrid: { value: 0.55 },
+  uRot: { value: new THREE.Matrix3() }, uRotInv: { value: new THREE.Matrix3() },
+};
+
+const vertexShader = noiseGLSL + `
+uniform float uTime; uniform float uReal; uniform vec3 uTwist; uniform vec3 uSpin; uniform vec3 uDir; uniform float uAmp;
+uniform vec3 uGrabDir; uniform float uDent; uniform float uTremble;
+varying vec3 vN; varying vec3 vW; varying vec3 vObj; varying vec3 vSph; varying vec3 vNo; varying float vDentF;
+
+vec3 deform(vec3 n){
+  float t=uTime;
+  float d = 0.07*snoise(n*1.3+vec3(t*0.21,t*0.27,t*0.17))
+          + 0.03*snoise(n*2.6-vec3(t*0.33,0.0,t*0.29))
+          + 0.009*snoise(n*5.5+t*0.5);
+  // 화났을 때 부르르
+  d += uTremble*0.02*snoise(n*6.0+vec3(uReal*19.0,uReal*23.0,uReal*17.0));
+  vec3 q=n*(1.0+d);
+  float w = 0.65+0.35*snoise(n*1.8+3.0);
+  q += cross(uTwist, q) * w;
+  float sp = length(uSpin);
+  if(sp>1e-4){
+    vec3 ax=uSpin/sp; vec3 perp=q-ax*dot(q,ax);
+    q += perp*min(sp*sp*0.004,0.12) - ax*dot(q,ax)*min(sp*sp*0.003,0.08);
+  }
+  float a=dot(n,uDir);
+  q += uDir*a*uAmp - (n-uDir*a)*uAmp*0.5;
+  float c = 1.0-dot(n,uGrabDir);
+  float core = exp(-c*22.0); float ring = exp(-c*6.5)-core; float far = exp(-c*1.4)-exp(-c*6.5);
+  float wob = 1.0 + 0.25*snoise(n*5.0+uTime*0.3);
+  q -= n*uDent*core*0.26*wob; q += n*uDent*ring*0.075; q += n*uDent*far*0.025;
+  return q;
+}
+float dentF(vec3 n){ float c=1.0-dot(n,uGrabDir); return exp(-c*22.0)*uDent; }
+
+void main(){
+  vec3 n=normalize(position);
+  vec3 up = abs(n.y)<0.99 ? vec3(0.0,1.0,0.0) : vec3(1.0,0.0,0.0);
+  vec3 t1=normalize(cross(n,up)); vec3 t2=cross(n,t1);
+  float e=0.008;
+  vec3 p0=deform(n); vec3 p1=deform(normalize(n+t1*e)); vec3 p2=deform(normalize(n+t2*e));
+  vec3 nn=normalize(cross(p1-p0,p2-p0)); if(dot(nn,n)<0.0) nn=-nn;
+  vec4 wp=modelMatrix*vec4(p0,1.0);
+  vW=wp.xyz; vN=normalize(mat3(modelMatrix)*nn); vObj=p0; vSph=n; vNo=nn; vDentF=dentF(n);
+  gl_Position=projectionMatrix*viewMatrix*wp;
+}`;
+
+const fragmentShader = noiseGLSL + `
+uniform float uTime; uniform float uBack; uniform mat3 uRot; uniform mat3 uRotInv;
+uniform vec3 uPal[6]; uniform float uIrid;
+varying vec3 vN; varying vec3 vW; varying vec3 vObj; varying vec3 vSph; varying vec3 vNo; varying float vDentF;
+
+float hash1(vec3 p){ return fract(sin(dot(p,vec3(127.1,311.7,74.7)))*43758.5453); }
+vec3 hash3(vec3 p){ return fract(sin(vec3(dot(p,vec3(127.1,311.7,74.7)),dot(p,vec3(269.5,183.3,246.1)),dot(p,vec3(113.5,271.9,124.6))))*43758.5453); }
+
+vec3 field(vec3 p, float t){
+  float n1=snoise(p*0.42+vec3(t*0.04,0.0,t*0.03));
+  float n2=snoise(p*0.55-vec3(0.0,t*0.045,t*0.025)+7.1);
+  float n3=snoise(p*0.68+vec3(t*0.03,t*0.04,0.0)+13.7);
+  vec3 c = mix(uPal[0], uPal[1], smoothstep(-0.6,0.6,n1));
+  c = mix(c, uPal[2], smoothstep(0.15,0.75,n2)*0.85);
+  c = mix(c, uPal[3], smoothstep(0.2,0.8,n3)*0.8);
+  c = mix(c, uPal[4], smoothstep(0.35,0.9,-n2)*0.7);
+  c = mix(c, uPal[5], smoothstep(0.45,0.95,n1*n3*2.0)*0.6);
+  return c;
+}
+vec3 film(float x){ return 0.5+0.5*cos(6.28318*(vec3(1.0)*x+vec3(0.0,0.33,0.67))); }
+
+#ifdef LITE
+  #define INC_STEPS 3
+#else
+  #define INC_STEPS 6
+#endif
+vec2 inclusions(vec3 ro, vec3 rd, float t){
+  float bub=0.0, spk=0.0;
+  for(int k=0;k<INC_STEPS;k++){
+    float fk=float(k);
+    vec3 p = ro + rd*(0.08+0.2*fk);
+    if(length(p)>0.9) continue;
+    p += vec3(sin(t*0.05),t*0.015,cos(t*0.04))*0.3;
+    vec3 g=p/0.26; vec3 id=floor(g); vec3 f=fract(g);
+    if(hash1(id)>0.82){
+      vec3 cc=0.3+0.4*hash3(id);
+      float r=0.05+0.09*hash1(id+3.1);
+      float d=length(f-cc);
+      float rimB=smoothstep(r,r*0.8,d)*smoothstep(r*0.45,r*0.85,d);
+      float hl=smoothstep(r*0.35,0.0,length(f-cc-vec3(-0.3,0.35,0.3)*r));
+      bub += (rimB*0.8+hl*0.9)*(1.0-fk*0.13);
+    }
+    vec3 g2=p/0.07; vec3 id2=floor(g2); vec3 f2=fract(g2);
+    if(hash1(id2+9.7)>0.975){
+      float d2=length(f2-hash3(id2));
+      spk += smoothstep(0.12,0.0,d2)*(0.6+0.4*sin(t*2.0+hash1(id2)*30.0))*(1.0-fk*0.12);
+    }
+  }
+  return vec2(bub, spk);
+}
+
+void main(){
+  vec3 N=normalize(vN);
+  vec3 V=normalize(cameraPosition-vW);
+  bool back = uBack > 0.5;
+  if(back) N=-N;
+  float t=uTime;
+  if(!back){
+    float e=0.015; vec3 sp=vSph*9.0+vec3(0.0,t*0.15,0.0);
+    float n0=snoise(sp);
+    vec3 grd=vec3(snoise(sp+vec3(e,0,0))-n0, snoise(sp+vec3(0,e,0))-n0, snoise(sp+vec3(0,0,e))-n0)/e;
+    #ifdef LITE
+    vec3 pert = uRot*(grd*0.013);
+    #else
+    vec3 sp2=vSph*26.0-t*0.1;
+    float m0=snoise(sp2);
+    vec3 grd2=vec3(snoise(sp2+vec3(e,0,0))-m0, snoise(sp2+vec3(0,e,0))-m0, snoise(sp2+vec3(0,0,e))-m0)/e;
+    vec3 pert = uRot*(grd*0.012 + grd2*0.004);
+    #endif
+    N = normalize(N - (pert - N*dot(pert,N)));
+  }
+  float ndv=clamp(abs(dot(N,V)),0.0,1.0);
+  float fres=pow(1.0-ndv,2.0);
+  vec3 L=normalize(vec3(-0.5,0.8,0.6));
+  vec3 R=reflect(-V,N);
+
+  if(back){
+    vec3 c = field(vObj - N*0.5 + 2.3, t);
+    c = mix(c, c*c, 0.35);
+    gl_FragColor = vec4(c, 0.5 + 0.25*(1.0-ndv));
+    return;
+  }
+
+  vec3 inner = field(vObj + N*0.3, t);
+  inner = mix(inner, inner*inner*1.05, clamp(vDentF,0.0,1.0)*0.45);
+  vec3 col = inner;
+  float wrap=(dot(N,L)+0.8)/1.8;
+  col *= 0.82+0.25*wrap;
+
+  float vein = smoothstep(0.035,0.0,abs(snoise(vObj*1.6+vec3(0.0,t*0.04,t*0.03))));
+  vein *= smoothstep(0.2,0.8,ndv);
+  col += vec3(1.0,0.97,1.0)*vein*0.12;
+
+  vec3 Vo = normalize(uRotInv*V);
+  vec3 rd = normalize(-Vo - normalize(vNo)*0.25);
+  vec2 inc = inclusions(vObj, rd, t);
+  col += vec3(1.0)*inc.x*0.35 + vec3(1.0,0.98,0.95)*inc.y*0.8;
+
+  vec3 L2=normalize(vec3(0.7,-0.5,-0.3));
+  float back2 = pow(clamp(dot(-N,L2)*0.5+0.5,0.0,1.0),3.0)*fres;
+  col += mix(vec3(0.85), vec3(0.75,0.85,1.0), uIrid/0.55)*back2*0.25;
+
+  float fx = fres*1.4 + snoise(vSph*1.0+t*0.06)*0.2 + 0.15;
+  vec3 irid = mix(vec3(1.0), film(fx), uIrid);
+  col = mix(col, irid, smoothstep(0.15,0.95,fres)*0.6);
+
+  float box1 = smoothstep(0.92,0.975,dot(R,normalize(vec3(-0.45,0.6,0.65))));
+  float box2 = smoothstep(0.955,0.99,dot(R,normalize(vec3(0.6,-0.3,0.75))));
+  float spec = pow(max(dot(R,L),0.0),180.0);
+  float rim  = smoothstep(0.75,1.0,fres)*0.25;
+  float glint = box1*0.65 + box2*0.35 + spec*1.3;
+  col += glint + rim;
+
+  float alpha = mix(0.32, 0.88, fres);
+  alpha = mix(alpha, min(alpha+0.3,0.95), clamp(vDentF,0.0,1.0));
+  alpha += inc.x*0.15 + inc.y*0.3;
+  alpha = clamp(max(alpha, glint*0.9), 0.0, 1.0);
+  gl_FragColor = vec4(clamp(col,0.0,1.0), alpha);
+}`;
+
+// 모바일은 정점 수를 크게 줄임 (64 → 26: 약 1/6)
+const geo = new THREE.IcosahedronGeometry(1, IS_MOBILE ? 26 : 64);
+const geoBack = IS_MOBILE ? new THREE.IcosahedronGeometry(1, 18) : geo;
+const makeMat = back => new THREE.ShaderMaterial({
+  uniforms: Object.assign({}, uniforms, { uBack: { value: back ? 1 : 0 } }),
+  vertexShader, fragmentShader, transparent: true, depthWrite: false,
+  side: back ? THREE.BackSide : THREE.FrontSide,
+  defines: IS_MOBILE ? { LITE: 1 } : {},
+});
+const group = new THREE.Group();
+const backMesh = new THREE.Mesh(geoBack, makeMat(true));  backMesh.renderOrder = 0;
+const frontMesh = new THREE.Mesh(geo, makeMat(false)); frontMesh.renderOrder = 1;
+group.add(backMesh, frontMesh);
+scene.add(group);
+
+/* ===== 감정 ===== */
+const hex = h => new THREE.Vector3(((h>>16)&255)/255, ((h>>8)&255)/255, (h&255)/255);
+const MOODS = {
+  //        팔레트 6색                                                   무지갯빛  움직임 속도  떨림
+  calm:  { pal: [0xF29ED1, 0xBDA8F5, 0x9EEBDB, 0xFFC7A3, 0xA3CCFF, 0xFAEDAD], irid: 0.55, speed: 1.0, trem: 0 },   // 처음: 핑크
+  joy:   { pal: [0xFFE48A, 0xFFD36B, 0xFFC27A, 0xFFF3C4, 0xE4F59A, 0xFFD1A1], irid: 0.5,  speed: 1.45, trem: 0 },  // 기쁨: 노랑
+  sad:   { pal: [0x9DB8F7, 0x8C9EEB, 0xA3D9F2, 0xB8B3F2, 0x7FADE6, 0xC7D9FA], irid: 0.4,  speed: 0.45, trem: 0 },  // 슬픔: 파랑
+  angry: { pal: [0xF76B6B, 0xF24D61, 0xFF8C66, 0xE65A80, 0xFF9E80, 0xD9404D], irid: 0.3,  speed: 1.9, trem: 0.8 }, // 화남: 빨강
+  numb:  { pal: [0xD1D1D6, 0xBFBFC4, 0xE0E0E3, 0xB3B3B8, 0xCCCCCC, 0xE6E6E6], irid: 0.0,  speed: 0.12, trem: 0 },  // 무감각: 무채색
+  surprise:{ pal:[0xC2F7EE, 0xE8FFFB, 0x9EEFF0, 0xFFF7B3, 0xD6E8FF, 0xF2FFF9], irid: 0.75, speed: 2.4, trem: 0 },  // 놀람: 투명한 민트
+  anxious:{ pal: [0x9C8AD9, 0x7F78C9, 0xB59BD6, 0x8C7FB8, 0xA899E0, 0x6E6AB0], irid: 0.3,  speed: 1.6, trem: 0.25 }, // 불안: 탁한 보라
+};
+for (const k in MOODS) MOODS[k].vec = MOODS[k].pal.map(hex);
+
+const FIRST_GRACE = 45; // 처음 켜고 한 번도 안 만졌을 때, 슬퍼지기까지
+const SAD_AFTER = 15;   // 만지다가 떠난 뒤, 슬퍼지기까지 (초)
+const NUMB_AFTER = 15;  // 슬퍼진 뒤 무채색이 되기까지 추가 시간 (총 30초)
+let mood = 'calm', everUsed = false;
+let lastUse = performance.now();
+let anger = 0, isAngry = false;
+let surpriseT = 0;                        // 오래 방치됐다가 갑자기 잡히면
+let over = false, offSince = performance.now();   // 커서가 말랑이 위에 있는지
+const ANXIOUS_AFTER = 5;                  // 커서가 말랑이에서 떠나 있으면 불안해지기까지 (초)
+let sizeNow = 1;
+let lastHoverMove = 0, petT = 0;          // 클릭 없이 커서로 쓰다듬은 시간
+const PET_TO_CALM = 5;                    // 화가 났을 때 이만큼 쓰다듬으면 풀림 (초)
+let speedNow = 1, tremNow = 0;
+MOODS.calm.vec.forEach((v,i) => uniforms.uPal.value[i].copy(v));
+
+/* ===== 물리 상태 ===== */
+const quat = new THREE.Quaternion();
+const omega = new THREE.Vector3(0.12, 0.35, 0.05), prevOmega = omega.clone();
+const twist = new THREE.Vector3(), twistV = new THREE.Vector3();
+let amp = 0, ampV = 0;
+const dirObj = new THREE.Vector3(0,0,1);
+let dent = 0, dentV = 0, dragSpeed = 0;
+const grabDir = new THREE.Vector3(0,0,1);
+let dragging = false, grabbed = false, grabStart = 0, lastX = 0, lastY = 0, lastT = 0;
+let lastDown = 0, downX = 0, downY = 0, moved = false;
+const dragOmega = new THREE.Vector3();
+const raycaster = new THREE.Raycaster(), ndc = new THREE.Vector2();
+const sphere = new THREE.Sphere(new THREE.Vector3(), 1.0), hitP = new THREE.Vector3();
+
+const touch = () => { lastUse = performance.now(); everUsed = true; };
+
+function hitBlob(e){
+  const r = canvas.getBoundingClientRect();
+  ndc.set(((e.clientX-r.left)/r.width)*2-1, -((e.clientY-r.top)/r.height)*2+1);
+  raycaster.setFromCamera(ndc, camera);
+  sphere.center.copy(group.position); sphere.radius = sizeNow;
+  return raycaster.ray.intersectSphere(sphere, hitP);
+}
+let lastPointerType = 'mouse';
+const LONG_PRESS = 320;      // 모바일: 이만큼 꾹 누르면 "잡기"
+let pending = null;          // 모바일: 꾹 누르기를 기다리는 중
+let stroking = false;        // 모바일: 손가락으로 쓰다듬는 중
+const buzz = ms => { try { navigator.vibrate && navigator.vibrate(ms); } catch {} };
+
+// 잡기 시작 (마우스 클릭, 또는 모바일 꾹 누르기)
+function beginGrab(pt){
+  dragging = true; canvas.classList.add('grabbing');
+  lastX = downX = pt.clientX; lastY = downY = pt.clientY; lastT = performance.now();
+  moved = false;
+  dragOmega.set(0,0,0);
+  omega.set(0,0,0);
+  if (mood === 'sad' || mood === 'numb') { surpriseT = 1.8; ampV += 1.6; }
+  over = true;
+  touch();
+  const now = performance.now();
+  if (now - lastDown < 350) anger += 0.12;
+  lastDown = now;
+  const inv = quat.clone().invert();
+  if (hitBlob(pt)) {
+    grabbed = true; grabStart = now;
+    grabDir.copy(hitP).sub(group.position).normalize().applyQuaternion(inv);
+    dirObj.copy(grabDir);
+    dentV += 3.5; ampV -= 0.5;
+  } else { dirObj.set(0,0,1).applyQuaternion(inv); ampV -= 0.3; }
+}
+
+canvas.addEventListener('pointerdown', e => {
+  lastPointerType = e.pointerType;
+  canvas.setPointerCapture(e.pointerId);
+  if (e.pointerType === 'mouse') { beginGrab(e); return; }
+  // 터치: 바로 잡지 않고, 꾹 누르는지 / 움직이는지 지켜봄
+  const isOver = !!hitBlob(e);
+  if (isOver) { over = true; lastUse = performance.now(); }
+  pending = { x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY,
+    timer: setTimeout(() => {
+      if (!pending) return;
+      const p = pending; pending = null;
+      beginGrab({ clientX: p.lx, clientY: p.ly });
+      buzz(12);
+    }, LONG_PRESS) };
+});
+
+canvas.addEventListener('pointermove', e => {
+  const now = performance.now();
+  if (pending) {
+    pending.lx = e.clientX; pending.ly = e.clientY;
+    if (Math.hypot(e.clientX - pending.x, e.clientY - pending.y) > 10) {
+      clearTimeout(pending.timer); pending = null; stroking = true;   // 꾹 누르기 전에 움직이면 쓰다듬기
+    } else return;
+  }
+  if (stroking || (!dragging && e.pointerType === 'mouse')) {
+    // 쓰다듬기 / 마우스 호버
+    const isOver = !!hitBlob(e);
+    if (!isOver && over) offSince = now;
+    over = isOver;
+    if (over) { lastUse = now; lastHoverMove = now; everUsed = everUsed || stroking; }
+    return;
+  }
+  if (!dragging) return;
+  // 잡은 채로 손이 살짝 떨리는 정도로는 돌지 않게
+  if (!moved && Math.hypot(e.clientX - downX, e.clientY - downY) < 8) { lastX = e.clientX; lastY = e.clientY; lastT = now; return; }
+  moved = true;
+  const dt = Math.max((now - lastT) / 1000, 1/60);
+  const dx = e.clientX - lastX, dy = e.clientY - lastY;
+  const s = 4.2 / Math.min(canvas.clientWidth, canvas.clientHeight);
+  dragOmega.lerp(new THREE.Vector3(dy*s/dt, dx*s/dt, 0).clampLength(0, 14), 0.6);
+  dragSpeed = Math.min(Math.hypot(dx, dy) / dt / 1500, 1);
+  lastX = e.clientX; lastY = e.clientY; lastT = now;
+  touch();
+});
+canvas.addEventListener('pointerleave', () => { if (!dragging && !stroking && !pending) { if (over) offSince = performance.now(); over = false; } });
+
+const release = () => {
+  const now = performance.now();
+  if (pending) {
+    // 짧게 톡 — 살짝 건드림
+    clearTimeout(pending.timer); pending = null;
+    if (over) { ampV -= 0.25; touch(); }
+    over = false; offSince = now;
+    return;
+  }
+  if (stroking) { stroking = false; over = false; offSince = now; return; }
+  if (!dragging) return;
+  dragging = false; canvas.classList.remove('grabbing');
+  if (grabbed) { grabbed = false; dentV -= 1.2; ampV += 0.6; } else ampV += 0.3;
+  if (lastPointerType !== 'mouse') { over = false; offSince = now; }
+  touch();
+};
+canvas.addEventListener('pointerup', release);
+canvas.addEventListener('pointercancel', release);
+
+const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+function resize(){
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w/h;
+  camera.position.z = w/h < 0.85 ? 6 * 0.85 / (w/h) : 6;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize); resize();
+
+const clock = new THREE.Clock();
+const tmpQ = new THREE.Quaternion(), tmpV = new THREE.Vector3();
+let hopT = 0, holdSlow = 1;
+
+function updateMood(dt){
+  const now = performance.now();
+  const idle = (now - lastUse) / 1000;
+  const spin = omega.length();
+
+  // 화남: 세게 휘두르기, 오래 꾹 누르기, 연달아 마구 누르기
+  let rough = 0;
+  if (dragging) rough += Math.max(dragSpeed - 0.35, 0) * 1.6;
+  if (grabbed) { const hold = (now - grabStart) / 1000; if (hold > 2) rough += 0.35 + Math.min(hold - 2, 4) * 0.08; }
+  anger += rough * dt;
+  anger -= (rough > 0 ? 0 : 0.1) * dt;
+  anger = THREE.MathUtils.clamp(anger, 0, 2);
+  if (!isAngry && anger > 1) isAngry = true;
+  if (isAngry && anger < 0.35) isAngry = false;
+
+  // 스담스담: 화가 났을 때, 누르지 않고 커서로 말랑이 위를 쓰다듬으면 서서히 풀림
+  const petting = isAngry && over && !dragging && (now - lastHoverMove) < 250;
+  if (petting) petT += dt;
+  else if (!isAngry) petT = 0;
+  if (isAngry && petT >= PET_TO_CALM) {
+    isAngry = false; anger = 0; petT = 0;
+    lastUse = now; everUsed = true;
+    ampV -= 0.6;                          // 기분 풀려서 통
+  }
+
+  // 불안: 한 번 만져준 뒤, 커서가 말랑이 위를 떠나 있으면
+  const anxious = everUsed && !over && !dragging && (now - offSince) / 1000 > ANXIOUS_AFTER;
+
+  surpriseT = Math.max(surpriseT - dt, 0);
+
+  if (surpriseT > 0) mood = 'surprise';
+  else if (isAngry) mood = 'angry';
+  else if (idle > (everUsed ? SAD_AFTER : FIRST_GRACE) + NUMB_AFTER) mood = 'numb';
+  else if (idle > (everUsed ? SAD_AFTER : FIRST_GRACE)) mood = 'sad';
+  else if (anxious) mood = 'anxious';
+  else mood = everUsed ? 'joy' : 'calm';
+
+  const M = MOODS[mood];
+  const rate = { numb: 0.25, angry: 1.4, surprise: 5, anxious: 0.7 }[mood] || 0.8;
+  const k = 1 - Math.exp(-rate * dt);
+  for (let i = 0; i < 6; i++) uniforms.uPal.value[i].lerp(M.vec[i], k);
+  uniforms.uIrid.value += (M.irid - uniforms.uIrid.value) * k;
+  speedNow += (M.speed - speedNow) * (1 - Math.exp(-1.2*dt));
+  // 쓰다듬는 동안 떨림이 점점 잦아듦
+  const tremT = mood === 'angry' ? M.trem * Math.min(anger, 1.3) * (1 - 0.8 * petT / PET_TO_CALM) : M.trem;
+  tremNow += (tremT - tremNow) * (1 - Math.exp(-4*dt));
+
+  // 크기: 불안하면 움츠러들고, 놀라면 부풀었다가 돌아옴
+  const sizeT = mood === 'anxious' ? 0.9 : mood === 'surprise' ? 1.08 : 1;
+  sizeNow += (sizeT - sizeNow) * (1 - Math.exp(-(mood === 'surprise' ? 10 : 2) * dt));
+
+  // 기쁠 땐 가끔 통통 튐
+  if (mood === 'joy' && !dragging) {
+    hopT += dt;
+    if (hopT > 1.6 + Math.random()*1.5) { hopT = 0; ampV -= 0.35; }
+  }
+  // 불안할 땐 얕고 빠른 숨
+  if (mood === 'anxious') amp += Math.sin(now * 0.012) * 0.004;
+}
+
+let perfAcc = 0, perfN = 0;
+function adapt(rawDt){
+  perfAcc += rawDt; perfN++;
+  if (perfAcc > 2) {
+    const avg = perfAcc / perfN; perfAcc = 0; perfN = 0;
+    if (avg > 1/42 && pixelRatio > 0.75) { pixelRatio = Math.max(0.75, pixelRatio - 0.25); renderer.setPixelRatio(pixelRatio); resize(); }
+  }
+}
+function tick(){
+  const rawDt = clock.getDelta();
+  adapt(rawDt);
+  const dt = Math.min(rawDt, 1/30);
+  const real = uniforms.uReal.value += dt;
+  updateMood(dt);
+  // 쥐고 있는 동안은 속의 색 흐름도 거의 멈춤
+  holdSlow += ((grabbed && !moved ? 0.15 : 1) - holdSlow) * (1 - Math.exp(-10*dt));
+  uniforms.uTime.value += dt * speedNow * holdSlow * (reduce ? 0.3 : 1);
+
+  prevOmega.copy(omega);
+  if (dragging) {
+    omega.lerp(dragOmega, 1 - Math.exp(-18*dt));
+    dragOmega.multiplyScalar(Math.exp(-14*dt));
+    if (!moved) omega.set(0,0,0);   // 쥐고만 있으면 완전히 정지
+  } else {
+    omega.multiplyScalar(Math.exp(-0.35*dt));
+    const drift = new THREE.Vector3(Math.sin(real*0.13)*0.08, 0.18+Math.sin(real*0.09)*0.06, Math.cos(real*0.11)*0.05).multiplyScalar(Math.min(speedNow, 1.3));
+    omega.lerp(drift, 1 - Math.exp(-0.15*dt));
+  }
+  const ang = omega.length() * dt * (reduce ? 0.3 : 1);
+  if (ang > 1e-6) { tmpQ.setFromAxisAngle(tmpV.copy(omega).normalize(), ang); quat.premultiply(tmpQ).normalize(); }
+  group.quaternion.copy(quat);
+  const inv = quat.clone().invert();
+
+  const accel = omega.clone().sub(prevOmega).divideScalar(Math.max(dt,1e-4));
+  twistV.addScaledVector(twist, -38*dt);
+  twistV.addScaledVector(accel.clone().applyQuaternion(inv), -0.0035);
+  twistV.multiplyScalar(Math.exp(-2.6*dt));
+  twist.addScaledVector(twistV, dt).clampLength(0, 0.5);
+
+  ampV += -amp * 60 * dt + (dragging ? (-0.05 - amp) * 20 * dt : 0);
+  ampV *= Math.exp(-2.4*dt);
+  amp = THREE.MathUtils.clamp(amp + ampV * dt, -0.3, 0.3);
+
+  let dentTarget = 0;
+  if (grabbed) {
+    const hold = (performance.now() - grabStart) / 1000;
+    dentTarget = 0.75 + Math.min(hold, 1.5) * 0.25 + dragSpeed * 0.35;
+    dentTarget *= 1 + Math.sin(real*9.0) * 0.015;
+  }
+  dragSpeed *= Math.exp(-6*dt);
+  dentV += (dentTarget - dent) * (grabbed ? 70 : 95) * dt;
+  dentV *= Math.exp(-(grabbed ? 6.0 : 3.2) * dt);
+  dent = THREE.MathUtils.clamp(dent + dentV * dt, -0.5, 1.6);
+
+  group.position.set(Math.sin(real*0.37)*0.05, Math.sin(real*0.51)*0.07*Math.min(speedNow,1.2), 0);
+  group.scale.setScalar(sizeNow);
+
+  uniforms.uTwist.value.copy(twist);
+  uniforms.uSpin.value.copy(omega).applyQuaternion(inv);
+  uniforms.uDir.value.copy(dirObj);
+  uniforms.uAmp.value = amp;
+  uniforms.uGrabDir.value.copy(grabDir);
+  uniforms.uDent.value = dent;
+  uniforms.uTremble.value = tremNow;
+  uniforms.uRot.value.setFromMatrix4(new THREE.Matrix4().makeRotationFromQuaternion(quat));
+  uniforms.uRotInv.value.copy(uniforms.uRot.value).transpose();
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+tick();
+</script>
+</body>
+</html>
